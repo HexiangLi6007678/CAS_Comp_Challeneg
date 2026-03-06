@@ -1,0 +1,968 @@
+```{r}
+install.packages(patchwork)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(broom)
+library(purrr)
+library(MASS)   # stepAIC, glm.nb
+library(car)    # vif
+```
+
+```{r}
+df <- read_xlsx("cas_data.xlsx")
+
+df <- df %>%
+  mutate(
+    coverage   = factor(coverage),
+    holdout    = as.logical(holdout),
+    risk_tier  = factor(risk_tier),
+    class      = factor(class),
+    study      = factor(study),
+    greek      = factor(greek),
+    off_campus = factor(off_campus),
+    sprinklered = factor(sprinklered),
+    amount     = as.numeric(amount),
+    distance_to_campus = as.numeric(distance_to_campus)
+  )
+```
+
+```{r}
+# 构造 distance 分箱（按分位数）
+df <- df %>%
+  mutate(
+    log_distance = log(distance_to_campus + 1),
+    
+    distance_bin = case_when(
+      distance_to_campus == 0 ~ "On campus",
+      distance_to_campus > 0  ~ as.character(
+        cut(
+          distance_to_campus,
+          breaks = quantile(
+            distance_to_campus[distance_to_campus > 0],
+            probs = c(0, .33, .66, 1),
+            na.rm = TRUE
+          ),
+          include.lowest = TRUE
+        )
+      ),
+      TRUE ~ NA_character_
+    ),
+    distance_bin = factor(distance_bin)
+  )
+```
+
+```{r}
+# 只保留 severity 数据
+sev_data <- df %>% filter(amount > 0)
+
+train <- sev_data %>% filter(holdout == FALSE)
+test  <- sev_data %>% filter(holdout == TRUE)
+```
+
+```{r}
+############################ EDA ###############################3
+train %>%
+  group_by(coverage) %>%
+  summarise(
+    n = n(),
+    mean_amount = mean(amount, na.rm = TRUE),
+    median_amount = median(amount, na.rm = TRUE),
+    p90 = quantile(amount, 0.90, na.rm = TRUE),
+    p99 = quantile(amount, 0.99, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n))
+```
+```{r}
+ggplot(train, aes(x = greek, y = amount)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ coverage, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Severity (amount) by greek across coverages")
+
+ggplot(train, aes(x = off_campus, y = amount)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ coverage, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Severity (amount) by off_campus across coverages")
+
+ggplot(train, aes(x = sprinklered, y = amount)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ coverage, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Severity (amount) by sprinklered across coverages")
+
+ggplot(train, aes(x = risk_tier, y = amount)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ coverage, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Severity (amount) by risk_tier across coverages")
+
+# distance不适合作为变量
+ggplot(train, aes(x = distance_to_campus, y = amount)) +
+  geom_point(alpha = 0.15) +
+  geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~ coverage, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Severity vs distance_to_campus (train)")
+
+ggplot(train, aes(x = log_distance, y = amount)) +
+  geom_point(alpha = 0.15) +
+  geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~ coverage, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Severity vs log_distance (train)")
+```
+
+
+
+```{r}
+###################### full model #######################
+models_full <- list()
+
+for (cv in levels(train$coverage)) {
+
+  dcv <- train %>% filter(coverage == cv)
+
+  if (nrow(dcv) < 50) next  # 样本太少就跳过
+
+  fit_full <- glm(
+    amount ~ risk_tier + sprinklered + off_campus + greek + log_distance,
+    family = Gamma(link = "log"),
+    data = dcv
+  )
+
+  models_full[[cv]] <- fit_full
+
+  cat("\n====== Coverage:", cv, "======\n")
+  print(summary(fit_full))
+}
+```
+
+```{r}
+######################## check assumptions ########################
+p_scatter  <- list()
+p_smooth   <- list()
+p_hist     <- list()
+p_qq       <- list()
+
+for (cv in names(models_full)) {
+
+  fit <- models_full[[cv]]
+
+  res_df <- data.frame(
+    fitted = fitted(fit),
+    resid  = residuals(fit, type = "deviance")
+  )
+
+  # 1) Residuals vs Fitted (scatter)
+  p_scatter[[cv]] <- ggplot(res_df, aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.25, size = 1) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title = paste("Residuals vs Fitted:", cv),
+      x = "Fitted",
+      y = "Deviance residual"
+    ) +
+    theme(plot.title = element_text(size = 8))
+
+  # 2) Residuals vs Fitted (with smooth)
+  p_smooth[[cv]] <- ggplot(res_df, aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.2, size = 1) +
+    geom_smooth(se = FALSE) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title = paste("Residual trend:", cv),
+      x = "Fitted",
+      y = "Deviance residual"
+    ) +
+    theme(plot.title = element_text(size = 8))
+
+  # 3) Histogram of residuals
+  p_hist[[cv]] <- ggplot(res_df, aes(x = resid)) +
+    geom_histogram(bins = 40, fill = "grey", color = "white") +
+    theme_minimal() +
+    labs(
+      title = paste("Residual distribution:", cv),
+      x = "Deviance residual",
+      y = "Count"
+    ) +
+    theme(plot.title = element_text(size = 8))
+
+  # 4) QQ plot (ggplot-friendly)
+  qq_df <- data.frame(
+    theoretical = qqnorm(res_df$resid, plot.it = FALSE)$x,
+    sample      = qqnorm(res_df$resid, plot.it = FALSE)$y
+  )
+
+  p_qq[[cv]] <- ggplot(qq_df, aes(x = theoretical, y = sample)) +
+    geom_point(alpha = 0.4, size = 1) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title = paste("QQ plot:", cv),
+      x = "Theoretical quantiles",
+      y = "Sample quantiles"
+    ) +
+    theme(plot.title = element_text(size = 8))
+}
+
+wrap_plots(p_scatter, ncol = 2)
+wrap_plots(p_smooth,  ncol = 2)
+wrap_plots(p_hist,    ncol = 2)
+wrap_plots(p_qq,      ncol = 2)
+```
+```{r}
+# 去掉distance bin
+models_nodist <- list()
+
+for (cv in levels(train$coverage)) {
+
+  dcv <- train %>%
+    filter(coverage == cv) %>%
+    droplevels()
+
+  if (nrow(dcv) < 50) next  # 样本太少就跳过
+
+  fit_nodist <- glm(
+    amount ~ risk_tier + sprinklered + off_campus + greek,
+    family = Gamma(link = "log"),
+    data = dcv
+  )
+
+  models_nodist[[cv]] <- fit_nodist
+
+  cat("\n====== Coverage:", cv, "(No distance) ======\n")
+  print(summary(fit_nodist))
+}
+```
+
+```{r}
+######################## check assumptions ########################
+p_scatter  <- list()
+p_smooth   <- list()
+p_hist     <- list()
+p_qq       <- list()
+
+for (cv in names(models_nodist)) {
+
+  fit <- models_nodist[[cv]]
+
+  res_df <- data.frame(
+    fitted = fitted(fit),
+    resid  = residuals(fit, type = "deviance")
+  )
+
+  # 1) Residuals vs Fitted (scatter)
+  p_scatter[[cv]] <- ggplot(res_df, aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.25, size = 1) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title = paste("Residuals vs Fitted:", cv),
+      x = "Fitted",
+      y = "Deviance residual"
+    ) +
+    theme(plot.title = element_text(size = 8))
+
+  # 2) Residuals vs Fitted (with smooth)
+  p_smooth[[cv]] <- ggplot(res_df, aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.2, size = 1) +
+    geom_smooth(se = FALSE) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title = paste("Residual trend:", cv),
+      x = "Fitted",
+      y = "Deviance residual"
+    ) +
+    theme(plot.title = element_text(size = 8))
+
+  # 3) Histogram of residuals
+  p_hist[[cv]] <- ggplot(res_df, aes(x = resid)) +
+    geom_histogram(bins = 40, fill = "grey", color = "white") +
+    theme_minimal() +
+    labs(
+      title = paste("Residual distribution:", cv),
+      x = "Deviance residual",
+      y = "Count"
+    ) +
+    theme(plot.title = element_text(size = 8))
+
+  # 4) QQ plot (ggplot-friendly)
+  qq_df <- data.frame(
+    theoretical = qqnorm(res_df$resid, plot.it = FALSE)$x,
+    sample      = qqnorm(res_df$resid, plot.it = FALSE)$y
+  )
+
+  p_qq[[cv]] <- ggplot(qq_df, aes(x = theoretical, y = sample)) +
+    geom_point(alpha = 0.4, size = 1) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title = paste("QQ plot:", cv),
+      x = "Theoretical quantiles",
+      y = "Sample quantiles"
+    ) +
+    theme(plot.title = element_text(size = 8))
+}
+
+wrap_plots(p_scatter, ncol = 2)
+wrap_plots(p_smooth,  ncol = 2)
+wrap_plots(p_hist,    ncol = 2)
+wrap_plots(p_qq,      ncol = 2)
+```
+
+
+
+```{r}
+model_compare <- bind_rows(
+  lapply(names(models_full), function(cv) {
+
+    full <- models_full[[cv]]
+    reduced  <- models_nodist[[cv]]
+
+    tibble(
+      coverage = cv,
+
+      # AIC
+      AIC_full    = AIC(full),
+      AIC_reduced = AIC(reduced),
+
+      # Residual deviance
+      dev_full    = deviance(full),
+      dev_reduced = deviance(reduced),
+
+      # Dispersion (Gamma φ)
+      phi_full    = summary(full)$dispersion,
+      phi_reduced = summary(reduced)$dispersion
+    )
+  })
+)
+
+model_compare
+```
+```{r}
+#########对liability的测试##############
+fit_liab_full <- models_nodist[["Liability"]]
+
+fit_liab_norisk <- glm(
+  amount ~ sprinklered + off_campus + greek,
+  family = Gamma(link = "log"),
+  data = train %>% filter(coverage == "Liability")
+)
+
+AIC(fit_liab_full, fit_liab_norisk)
+
+
+fit_liab_min <- glm(
+  amount ~ off_campus + greek,
+  family = Gamma(link = "log"),
+  data = train %>% filter(coverage == "Liability")
+)
+
+AIC(fit_liab_norisk, fit_liab_min) #要不要删？？？
+```
+
+```{r}
+##################预测值##########################
+
+df_sev_pred <- df %>%
+  mutate(sev_pred = NA_real_)
+
+for (cv in names(models_nodist)) {
+  fit <- models_nodist[[cv]]
+  idx <- df_sev_pred$coverage == cv
+  df_sev_pred$sev_pred[idx] <- predict(fit, newdata = df_sev_pred[idx, ], type = "response")
+}
+
+# df_sev_pred$sev_pred
+```
+
+```{r}
+relativity <- bind_rows(
+  lapply(names(models_nodist), function(cv) {
+    tidy(models_nodist[[cv]]) %>%
+      mutate(
+        coverage = cv,
+        relativity = exp(estimate),
+        lower = exp(estimate - 1.96 * std.error),
+        upper = exp(estimate + 1.96 * std.error)
+      ) %>%
+      dplyr::select(coverage, term, estimate, std.error, p.value, relativity, lower, upper)
+  })
+)
+
+relativity
+```
+
+```{r}
+####################### validation #######################
+test_sev <- df %>%
+  filter(holdout == TRUE, amount > 0) %>%
+  mutate(sev_pred = NA_real_)
+
+for (cv in names(models_nodist)) {
+
+  idx <- test_sev$coverage == cv
+
+  if (sum(idx) == 0) next
+
+  test_sev$sev_pred[idx] <- predict(
+    models_nodist[[cv]],
+    newdata = test_sev[idx, ],
+    type = "response"
+  )
+}
+
+ggplot(test_sev, aes(x = sev_pred, y = amount)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  theme_minimal() +
+  labs(
+    title = "Actual vs Predicted Severity (Test Set)",
+    x = "Predicted Severity",
+    y = "Actual Severity"
+  )
+
+test_sev <- test_sev %>%
+  mutate(sev_bucket = ntile(sev_pred, 5))
+bucket_summary <- test_sev %>%
+  group_by(sev_bucket) %>%
+  summarise(
+    avg_actual = mean(amount),
+    avg_pred   = mean(sev_pred),
+    n = n(),
+    .groups = "drop"
+  )
+
+bucket_summary
+
+ggplot(bucket_summary, aes(x = sev_bucket)) +
+  geom_line(aes(y = avg_actual, color = "Actual"), linewidth = 1.2) +
+  geom_line(aes(y = avg_pred,   color = "Predicted"), linewidth = 1.2) +
+  scale_color_manual(values = c("Actual" = "black", "Predicted" = "steelblue")) +
+  theme_minimal() +
+  labs(
+    title = "Severity Model Validation (Test Set)",
+    x = "Predicted Severity Bucket",
+    y = "Average Severity",
+    color = ""
+  )
+
+```
+
+```{r}
+library(dplyr)
+library(Matrix)
+library(xgboost)
+
+# ---- severity 数据
+df_sev <- df %>% filter(!is.na(amount), amount > 0)
+
+# ---- 全局 holdout split（不要再叫 train/test，避免后面被覆盖）
+train_all <- df_sev %>% filter(holdout == FALSE)
+test_all  <- df_sev %>% filter(holdout == TRUE)
+
+drop_cols <- c("name","claim_id","amount","study","gender","gpa","class")  # 统一一次
+
+coverages <- levels(df_sev$coverage)
+
+models_gbm <- list()
+all_test_pred <- list()
+
+for (cov in coverages) {
+
+  cat("\n==============================\n")
+  cat("Coverage:", cov, "\n")
+  cat("==============================\n")
+
+  dcv <- df_sev %>% filter(coverage == cov) %>% droplevels()
+
+  train_cv <- dcv %>% filter(holdout == FALSE)
+  test_cv  <- dcv %>% filter(holdout == TRUE)
+
+  if (nrow(train_cv) < 50 || nrow(test_cv) < 10) {
+    cat("样本太少，跳过：train =", nrow(train_cv), "test =", nrow(test_cv), "\n")
+    next
+  }
+
+  # ---- y
+  y_train <- train_cv$amount
+  y_test  <- test_cv$amount
+
+  # ---- X (one-hot)
+  x_train_df <- train_cv %>%
+    dplyr::select(-any_of(drop_cols)) %>%
+    dplyr::select(-coverage)
+
+  x_test_df <- test_cv %>%
+    dplyr::select(-any_of(drop_cols)) %>%
+    dplyr::select(-coverage)
+
+  # 如果有 NA，先简单处理（推荐：类别 NA -> "Missing"，数值 NA -> median）
+  # 这里先最简单：drop NA（确保不会行数对不上）
+  keep_train <- complete.cases(x_train_df)
+  keep_test  <- complete.cases(x_test_df)
+
+  x_train_df <- x_train_df[keep_train, , drop = FALSE]
+  y_train    <- y_train[keep_train]
+
+  x_test_df <- x_test_df[keep_test, , drop = FALSE]
+  y_test    <- y_test[keep_test]
+  test_cv   <- test_cv[keep_test, , drop = FALSE]
+
+  X_train <- sparse.model.matrix(~ . - 1, data = x_train_df)
+  X_test  <- sparse.model.matrix(~ . - 1, data = x_test_df)
+
+  dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+  dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+  fit <- xgb.train(
+    params = list(
+      objective = "reg:gamma",
+      eta = 0.05,
+      max_depth = 4,
+      min_child_weight = 5,
+      subsample = 0.8,
+      colsample_bytree = 0.8
+    ),
+    data = dtrain,
+    nrounds = 300,
+    verbose = 0
+  )
+
+  pred <- predict(fit, dtest)
+  pred <- pmax(pred, 1e-6)
+
+  test_cv <- test_cv %>% mutate(pred_gbm = pred)
+
+  # coverage 内 decile 表
+  K <- 10
+  decile_tbl_cv <- test_cv %>%
+    mutate(q = ntile(pred_gbm, K)) %>%
+    group_by(q) %>%
+    summarise(
+      n = n(),
+      pred_mean = mean(pred_gbm),
+      obs_mean  = mean(amount),
+      .groups = "drop"
+    )
+
+  print(decile_tbl_cv)
+
+  models_gbm[[cov]] <- fit
+  all_test_pred[[cov]] <- test_cv
+}
+
+# ---- 合并所有 coverage 的 holdout 预测
+test_gbm_all <- bind_rows(all_test_pred)
+
+# ---- 汇总 decile 表（按 coverage 分组）
+K <- 10
+decile_tbl_all <- test_gbm_all %>%
+  group_by(coverage) %>%
+  mutate(q = ntile(pred_gbm, K)) %>%
+  group_by(coverage, q) %>%
+  summarise(
+    n = n(),
+    pred_mean = mean(pred_gbm),
+    obs_mean  = mean(amount),
+    .groups = "drop"
+  )
+
+decile_tbl_all
+
+```
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(nnet)
+
+# -----------------------------
+# 1) ANN (pure R) helper
+# -----------------------------
+fit_ann_severity_nnet <- function(train_df, test_df, feature_vars,
+                                  size = 10, decay = 1e-3, maxit = 500) {
+
+  fml <- as.formula(paste("~", paste(feature_vars, collapse = " + "), "- 1"))
+  X_train <- model.matrix(fml, data = train_df)
+  X_test  <- model.matrix(fml, data = test_df)
+
+  # standardize using train only
+  mu <- colMeans(X_train)
+  sdv <- apply(X_train, 2, sd); sdv[sdv == 0] <- 1
+  X_train <- scale(X_train, center = mu, scale = sdv)
+  X_test  <- scale(X_test,  center = mu, scale = sdv)
+
+  y_train <- log(train_df$amount)
+
+  nn <- nnet(
+    x = X_train, y = y_train,
+    size = size, linout = TRUE,
+    decay = decay, maxit = maxit,
+    trace = FALSE
+  )
+
+  pred <- exp(as.numeric(predict(nn, X_test)))
+  pmax(pred, 1e-6)
+}
+
+# -----------------------------
+# 2) Make quantile table with FIXED bins
+#    (so Actual line is identical across models)
+# -----------------------------
+make_quantile_tbl_fixedbin <- function(actual, pred, bin, model_name) {
+  tibble(
+    bin = bin,
+    actual = actual,
+    pred = pred
+  ) %>%
+    group_by(bin) %>%
+    summarise(
+      n = n(),
+      actual_mean = mean(actual, na.rm = TRUE),
+      pred_mean   = mean(pred,   na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(model = model_name)
+}
+
+# -----------------------------
+# 3) Plot: color = model, linetype = Actual/Pred
+# -----------------------------
+plot_quantile_3models_fixedbin <- function(q_all, title) {
+
+  q_long <- q_all %>%
+    pivot_longer(
+      cols = c(actual_mean, pred_mean),
+      names_to = "series",
+      values_to = "value"
+    ) %>%
+    mutate(
+      series = dplyr::recode(
+        series,
+        actual_mean = "Actual",
+        pred_mean   = "Predicted"
+      ),
+      lty = ifelse(series == "Actual", "solid", "dashed")
+    )
+
+  ggplot(q_long,
+         aes(x = bin, y = value,
+             color = model,
+             linetype = lty,
+             group = interaction(model, series))) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2) +
+    scale_linetype_identity() +
+    theme_minimal() +
+    labs(
+      title = title,
+      x = "Reference quantile bin (by GBM prediction)",
+      y = "Mean severity in bin",
+      color = "Model",
+      caption = "Solid = Actual mean (same bins for all models); Dashed = Predicted mean"
+    )
+}
+
+# optional: calibration error (for choosing best)
+qcal_error <- function(qdf) mean(abs(qdf$actual_mean - qdf$pred_mean))
+
+# -----------------------------
+# 4) Main: per coverage, compare GLM vs ANN vs GBM
+#    using GBM bins as reference
+# -----------------------------
+feature_vars <- c("risk_tier","sprinklered","off_campus","greek","log_distance")
+
+best_tbl <- tibble()
+
+for (cov in sort(unique(train_all$coverage))) {
+
+  # coverage-specific split
+  d_train <- train_all %>% filter(coverage == cov)
+  d_test  <- test_all  %>% filter(coverage == cov)
+
+  # GBM holdout predictions (must include pred_gbm)
+  d_test_gbm <- test_gbm_all %>% filter(coverage == cov)
+
+  # need enough data
+  if (nrow(d_train) < 50 || nrow(d_test) < 10 || nrow(d_test_gbm) < 10) next
+
+  # IMPORTANT: ensure d_test and d_test_gbm are the SAME rows order/length
+  # safest: join by claim_id if you have it; otherwise rely on same filtering pipeline
+  # Here we align by row order if counts match; otherwise do a join if claim_id exists
+  if (nrow(d_test) != nrow(d_test_gbm)) {
+    if ("claim_id" %in% names(d_test) && "claim_id" %in% names(d_test_gbm)) {
+      d_test <- d_test %>%
+        inner_join(d_test_gbm %>% select(claim_id, pred_gbm), by = "claim_id")
+      d_test_gbm <- d_test
+    } else {
+      cat("SKIP (cannot align test rows):", cov, "\n")
+      next
+    }
+  } else {
+    # bring pred_gbm into d_test
+    d_test <- d_test %>% mutate(pred_gbm = d_test_gbm$pred_gbm)
+  }
+
+  # choose bins K
+  K <- ifelse(nrow(d_test) < 120, 5, 10)
+
+  # reference bins defined by GBM predictions
+  ref_bin <- dplyr::ntile(d_test$pred_gbm, K)
+
+  # ---- GLM
+  fit_glm <- glm(
+    amount ~ risk_tier + sprinklered + off_campus + greek + log_distance,
+    family = Gamma(link = "log"),
+    data = d_train
+  )
+  pred_glm <- pmax(predict(fit_glm, newdata = d_test, type = "response"), 1e-6)
+
+  q_glm <- make_quantile_tbl_fixedbin(
+    actual = d_test$amount,
+    pred   = pred_glm,
+    bin    = ref_bin,
+    model_name = "GLM"
+  )
+
+  # ---- ANN
+  pred_ann <- fit_ann_severity_nnet(d_train, d_test, feature_vars,
+                                   size = 10, decay = 1e-3, maxit = 500)
+
+  q_ann <- make_quantile_tbl_fixedbin(
+    actual = d_test$amount,
+    pred   = pred_ann,
+    bin    = ref_bin,
+    model_name = "ANN"
+  )
+
+  # ---- GBM
+  q_gbm <- make_quantile_tbl_fixedbin(
+    actual = d_test$amount,
+    pred   = d_test$pred_gbm,
+    bin    = ref_bin,
+    model_name = "GBM"
+  )
+
+  # ---- plot (Actual lines will overlap now)
+  q_all <- bind_rows(q_glm, q_ann, q_gbm)
+  print(plot_quantile_3models_fixedbin(q_all, paste0(cov, " | 3-model calibration (K=", K, ")")))
+
+  # ---- optional: best model by quantile calibration error
+  e_glm <- qcal_error(q_glm)
+  e_ann <- qcal_error(q_ann)
+  e_gbm <- qcal_error(q_gbm)
+
+  best_tbl <- bind_rows(
+    best_tbl,
+    tibble(
+      coverage = as.character(cov),
+      K = K,
+      qerr_glm = e_glm,
+      qerr_ann = e_ann,
+      qerr_gbm = e_gbm,
+      best = c("GLM","ANN","GBM")[which.min(c(e_glm, e_ann, e_gbm))]
+    )
+  )
+}
+
+best_tbl
+```
+
+```{r}
+# quantile_compare <- function(actual, pred, K = 10) {
+#   tibble(actual = actual, pred = pred) |>
+#     mutate(bin = dplyr::ntile(pred, K)) |>
+#     group_by(bin) |>
+#     summarise(
+#       pred_mean = mean(pred),
+#       actual_mean = mean(actual),
+#       n = n(),
+#       .groups = "drop"
+#     )
+# }
+# 
+# plot_quantile_compare_multi <- function(df_list, title) {
+#   df <- bind_rows(df_list)
+# 
+#   ggplot(df, aes(x = bin, group = model)) +
+#     geom_line(aes(y = actual_mean)) +
+#     geom_point(aes(y = actual_mean)) +
+#     geom_line(aes(y = pred_mean), linetype = 2) +
+#     geom_point(aes(y = pred_mean), shape = 1) +
+#     theme_minimal() +
+#     labs(
+#       title = title,
+#       x = "Predicted quantile bin (1=low, 10=high)",
+#       y = "Mean in bin",
+#       caption = "Solid = Actual mean; Dashed = Predicted mean"
+#     )
+# }
+# 
+# # Quantile 校准误差：用来“每个 coverage 选 best”
+# qcal_error <- function(qdf) mean(abs(qdf$actual_mean - qdf$pred_mean))
+```
+
+```{r}
+# fit_ann_severity_nnet <- function(train_df, test_df, feature_vars,
+#                                   size = 10, decay = 1e-3, maxit = 500) {
+# 
+#   train_df <- dplyr::filter(train_df, amount > 0)
+#   test_df  <- dplyr::filter(test_df,  amount > 0)
+# 
+#   fml <- as.formula(paste("~", paste(feature_vars, collapse = " + "), "- 1"))
+#   X_train <- model.matrix(fml, data = train_df)
+#   X_test  <- model.matrix(fml, data = test_df)
+# 
+#   # 标准化（只用 train）
+#   mu <- colMeans(X_train)
+#   sdv <- apply(X_train, 2, sd); sdv[sdv == 0] <- 1
+#   X_train <- scale(X_train, center = mu, scale = sdv)
+#   X_test  <- scale(X_test,  center = mu, scale = sdv)
+# 
+#   y_train <- log(train_df$amount)
+# 
+#   nn <- nnet(
+#     x = X_train, y = y_train,
+#     size = size, linout = TRUE,
+#     decay = decay, maxit = maxit,
+#     trace = FALSE
+#   )
+# 
+#   pred_test <- exp(as.numeric(predict(nn, X_test)))
+# 
+#   list(
+#     pred = pred_test,
+#     actual = test_df$amount
+#   )
+# }
+```
+
+```{r}
+# library(nnet)
+# library(dplyr)
+# library(ggplot2)
+
+# quantile_compare <- function(actual, pred, K = 10) {
+#   tibble(actual = actual, pred = pred) |>
+#     mutate(bin = dplyr::ntile(pred, K)) |>
+#     group_by(bin) |>
+#     summarise(
+#       pred_mean = mean(pred),
+#       actual_mean = mean(actual),
+#       n = n(),
+#       .groups = "drop"
+#     )
+# }
+# 
+# plot_quantile_compare_multi <- function(df_list, title) {
+#   df <- bind_rows(df_list)
+# 
+#   ggplot(df, aes(x = bin, group = model)) +
+#     geom_line(aes(y = actual_mean)) +
+#     geom_point(aes(y = actual_mean)) +
+#     geom_line(aes(y = pred_mean), linetype = 2) +
+#     geom_point(aes(y = pred_mean), shape = 1) +
+#     theme_minimal() +
+#     labs(
+#       title = title,
+#       x = "Predicted quantile bin (1=low, 10=high)",
+#       y = "Mean in bin",
+#       caption = "Solid = Actual mean; Dashed = Predicted mean"
+#     )
+# }
+# 
+# qcal_error <- function(qdf) mean(abs(qdf$actual_mean - qdf$pred_mean))
+
+# fit_ann_severity_nnet <- function(train_df, test_df, feature_vars,
+#                                   size = 10, decay = 1e-3, maxit = 500) {
+# 
+#   train_df <- dplyr::filter(train_df, amount > 0)
+#   test_df  <- dplyr::filter(test_df,  amount > 0)
+# 
+#   fml <- as.formula(paste("~", paste(feature_vars, collapse = " + "), "- 1"))
+#   X_train <- model.matrix(fml, data = train_df)
+#   X_test  <- model.matrix(fml, data = test_df)
+# 
+#   mu <- colMeans(X_train)
+#   sdv <- apply(X_train, 2, sd); sdv[sdv == 0] <- 1
+#   X_train <- scale(X_train, center = mu, scale = sdv)
+#   X_test  <- scale(X_test,  center = mu, scale = sdv)
+# 
+#   y_train <- log(train_df$amount)
+# 
+#   nn <- nnet(
+#     x = X_train, y = y_train,
+#     size = size, linout = TRUE,
+#     decay = decay, maxit = maxit,
+#     trace = FALSE
+#   )
+# 
+#   pred_test <- exp(as.numeric(predict(nn, X_test)))
+# 
+#   list(pred = pred_test, actual = test_df$amount)
+# }
+
+# feature_vars <- c("risk_tier","sprinklered","off_campus","greek","log_distance")
+# 
+# best_by_coverage <- tibble()
+# 
+# for (cov in sort(unique(train_all$coverage))) {
+# 
+#   d_train <- train_all %>% filter(coverage == cov)
+#   d_test  <- test_all  %>% filter(coverage == cov)
+# 
+#   # 样本太少就跳
+#   if (nrow(d_train) < 80 || nrow(d_test) < 30) next
+# 
+#   # ---- GLM
+#   fit_glm <- glm(
+#     amount ~ risk_tier + sprinklered + off_campus + greek + log_distance,
+#     family = Gamma(link = "log"),
+#     data = d_train
+#   )
+# 
+#   pred_glm <- predict(fit_glm, newdata = d_test, type = "response")
+#   q_glm <- quantile_compare(d_test$amount, pred_glm, K = 10) %>%
+#     mutate(model = "GLM")
+#   err_glm <- qcal_error(q_glm)
+# 
+#   # ---- ANN (nnet)
+#   ann_res <- fit_ann_severity_nnet(d_train, d_test, feature_vars,
+#                                   size = 10, decay = 1e-3, maxit = 500)
+# 
+#   q_ann <- quantile_compare(ann_res$actual, ann_res$pred, K = 10) %>%
+#     mutate(model = "ANN")
+#   err_ann <- qcal_error(q_ann)
+# 
+#   # ---- plot
+#   print(plot_quantile_compare_multi(
+#     df_list = list(q_glm, q_ann),
+#     title = paste0(cov, " | Quantile comparison (GLM vs ANN)")
+#   ))
+# 
+#   best_by_coverage <- bind_rows(
+#     best_by_coverage,
+#     tibble(
+#       coverage = as.character(cov),
+#       qerr_glm = err_glm,
+#       qerr_ann = err_ann,
+#       best = ifelse(err_glm <= err_ann, "GLM", "ANN")
+#     )
+#   )
+# }
+# 
+# best_by_coverage
+```
+
+
+
+
